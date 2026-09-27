@@ -5,8 +5,11 @@ AI 超分引擎 (可选): pip install opencv-contrib-python numpy
 """
 
 import argparse
+import math
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -73,8 +76,23 @@ SR_SPEED_S_PER_MP = {"edsr": 225.0, "fsrcnn": 1.0}
 # Real-ESRGAN GPU 引擎 (ncnn-vulkan): 独立 exe, 走 Vulkan, 兼容 NVIDIA/AMD/Intel 显卡
 REALESRGAN_EXE = _base_dir() / "realesrgan-ncnn-vulkan" / "realesrgan-ncnn-vulkan.exe"
 REALESRGAN_MODEL = "realesrgan-x4plus-anime"   # 动漫特化模型 (通用照片可改 realesrgan-x4plus)
-REALESRGAN_TILE = 256        # exe 内部分块尺寸, 控制 VRAM 占用 (256 约需 2~3GB 显存)
+# exe 内部分块尺寸, 控制显存占用 (256 约需 1~2GB 空闲显存), 越小越稳但越慢。
+# 推理中途崩溃 (0xC0000005, 多为显存不足/驱动问题) 时沿阶梯自动减小分块重试。
+# 超大图 (超过 REALESRGAN_BIG_IMAGE_MP 百万像素) 整图单次推理即使小分块也会因
+# 长时间资源压力崩溃 (exe 需在内存持有完整 ×4 输出缓冲), 改为 Python 侧切条带、
+# 逐条独立短进程推理后拼接: 单条带 ≤ REALESRGAN_STRIP_MP 百万像素,
+# 条带间重叠 REALESRGAN_OVERLAP 像素消除拼接缝。
+REALESRGAN_TILE_LADDER = (256, 128, 64)
+REALESRGAN_BIG_IMAGE_MP = 12
+REALESRGAN_STRIP_MP = 8      # 条带推理: 单个条带的输入像素上限
+REALESRGAN_OVERLAP = 32      # 条带推理: 条带间重叠像素 (输入侧)
 REALESRGAN_S_PER_MP = 2.5    # 实测基准: RTX 3050 每百万输入像素约 2.5 秒 (含加载开销摊薄)
+
+# realesrgan-ncnn-vulkan 崩溃退出码 (Windows NTSTATUS) -> 人类可读原因
+_REALESRGAN_EXIT_HINTS = {
+    3221225477: "访问违例 0xC0000005, 多为显存不足或显卡驱动崩溃",
+    3221226505: "栈缓冲区溢出 0xC0000409",
+}
 
 # 经典 Lanczos 管线 (重采样 + 锐化 + 保存) 的粗略耗时基准, 用于 GUI 预计处理时间
 LANCZOS_S_PER_OUT_MP = 0.08   # 每百万输出像素约 0.08 秒
@@ -336,12 +354,67 @@ def realesrgan_available() -> bool:
     return REALESRGAN_EXE.exists()
 
 
+def _realesrgan_failure_message(proc, tile: int) -> str:
+    """汇总 exe 失败信息: 解读异常退出码, 过滤进度行与设备能力清单行。
+
+    崩溃时输出里通常是 "82.50%" 纯进度行和 "[0 NVIDIA ...] queueC=..." 这类
+    Vulkan 设备信息 (启动时必打印, 非报错), 全部滤掉只留真实错误。
+    """
+    hint = _REALESRGAN_EXIT_HINTS.get(proc.returncode, "")
+    lines = [ln.strip() for ln in
+             f"{proc.stderr or ''}\n{proc.stdout or ''}".splitlines()]
+    detail = " | ".join(ln for ln in lines
+                        if ln and not re.fullmatch(r"\d+(\.\d+)?%", ln)
+                        and not re.match(r"\[\d+\s", ln))
+    if len(detail) > 300:
+        detail = "…" + detail[-300:]
+    msg = f"分块 {tile}, exit={proc.returncode}"
+    if hint:
+        msg += f" ({hint})"
+    if detail:
+        msg += f": {detail}"
+    return msg
+
+
+def _run_realesrgan(in_png: Path, out_png: Path, tile: int):
+    """调用一次 realesrgan-ncnn-vulkan 推理进程。
+
+    -j 1:1:1 强制单线程推理: exe 默认 1:2:2 (加载:推理:保存) 会并发跑两个
+    分块, 显存峰值翻倍且交错分配加剧显存碎片化, 是推理中途 0xC0000005
+    崩溃的常见诱因; 单线程更稳, 速度损失很小。
+    """
+    cmd = [str(REALESRGAN_EXE),
+           "-i", str(in_png), "-o", str(out_png),
+           "-n", REALESRGAN_MODEL, "-s", "4",
+           "-t", str(tile), "-j", "1:1:1", "-f", "png"]
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+def _exe_upscale_with_ladder(in_png: Path, out_png: Path):
+    """沿分块阶梯尝试推理。成功把结果写入 out_png 并返回 None, 失败返回错误说明。"""
+    last_error = None
+    for i, tile in enumerate(REALESRGAN_TILE_LADDER):
+        out = out_png.with_name(f"{out_png.stem}_t{tile}.png")
+        proc = _run_realesrgan(in_png, out, tile)
+        if proc.returncode == 0 and out.exists():
+            out.replace(out_png)
+            return None
+        last_error = _realesrgan_failure_message(proc, tile)
+        if i + 1 < len(REALESRGAN_TILE_LADDER):
+            print(f"  [!] Real-ESRGAN 分块 {tile} 推理失败, "
+                  f"改用分块 {REALESRGAN_TILE_LADDER[i + 1]} 重试 "
+                  "(更小分块占用更少显存)")
+    return last_error
+
+
 def realesrgan_upscale_image(img: Image.Image, target_size: tuple,
                              keep_ratio: bool = True) -> Image.Image:
     """Real-ESRGAN GPU 超分: 模型原生 ×4 放大, 再精确对齐目标尺寸 target_size=(宽, 高)。
 
-    通过子进程调用 realesrgan-ncnn-vulkan (Vulkan 图形接口),
-    exe 内部按 REALESRGAN_TILE 分块推理控制显存, 大图无需在 Python 侧分块。
+    通过子进程调用 realesrgan-ncnn-vulkan (Vulkan 图形接口)。
+    小图整图一次推理; 超大图切条带逐条推理后拼接 (每条都是独立短进程,
+    避免单次超长推理的显存/内存累积压力导致原生崩溃)。
     """
     if not realesrgan_available():
         raise FileNotFoundError(
@@ -349,25 +422,50 @@ def realesrgan_upscale_image(img: Image.Image, target_size: tuple,
             "请下载 realesrgan-ncnn-vulkan Windows 版并解压到项目目录的 "
             "realesrgan-ncnn-vulkan/ 文件夹")
 
-    import subprocess
     tw, th = target_size
+    w, h = img.size
+    fail_hint = ("建议: 关闭占用显存的程序、更新显卡驱动, 或改用 Lanczos 引擎")
     with tempfile.TemporaryDirectory(prefix="realesrgan_") as td:
-        # 经临时目录中转, 避免源图路径含非 ASCII 字符导致 exe 读写失败
-        in_png = Path(td) / "in.png"
-        out_png = Path(td) / "out.png"
-        img.save(in_png, "PNG")
-        cmd = [str(REALESRGAN_EXE),
-               "-i", str(in_png), "-o", str(out_png),
-               "-n", REALESRGAN_MODEL, "-s", "4",
-               "-t", str(REALESRGAN_TILE), "-f", "png"]
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
-        if proc.returncode != 0 or not out_png.exists():
-            raise RuntimeError(
-                f"Real-ESRGAN GPU 推理失败 (exit={proc.returncode}): "
-                f"{(proc.stderr or proc.stdout).strip()[-300:]}")
-        with Image.open(out_png) as up:
-            result = up.convert(img.mode if img.mode in ("RGB", "RGBA") else "RGB").copy()
+        tdp = Path(td)
+        total_mp = w * h / 1e6
+        if total_mp <= REALESRGAN_BIG_IMAGE_MP:
+            # 小图: 经临时目录中转一次推理 (避免源图路径含非 ASCII 字符导致 exe 读写失败)
+            in_png = tdp / "in.png"
+            img.save(in_png, "PNG")
+            err = _exe_upscale_with_ladder(in_png, tdp / "out.png")
+            if err:
+                raise RuntimeError(
+                    f"Real-ESRGAN GPU 推理失败, 已尝试分块 "
+                    f"{'/'.join(str(t) for t in REALESRGAN_TILE_LADDER)}: "
+                    f"{err}\n{fail_hint}")
+            with Image.open(tdp / "out.png") as up:
+                result = up.convert(img.mode if img.mode in ("RGB", "RGBA") else "RGB").copy()
+        else:
+            # 超大图: 切条带分批推理后拼接, 每条带独立短进程, 失败重试代价也小
+            n = max(1, math.ceil(total_mp / REALESRGAN_STRIP_MP))
+            step = math.ceil(h / n)
+            m = REALESRGAN_OVERLAP
+            mode = img.mode if img.mode in ("RGB", "RGBA") else "RGB"
+            result = Image.new(mode, (w * 4, h * 4))
+            print(f"  [i] 超大图 ({total_mp:.0f}MP) 分 {n} 条带逐条推理, "
+                  f"输出 {w * 4}x{h * 4}")
+            for i in range(n):
+                y0, y1 = i * step, min(h, (i + 1) * step)
+                sy0, sy1 = max(0, y0 - m), min(h, y1 + m)
+                strip_in = tdp / f"in_{i}.png"
+                img.crop((0, sy0, w, sy1)).save(strip_in, "PNG")
+                err = _exe_upscale_with_ladder(strip_in, tdp / f"out_{i}.png")
+                if err:
+                    raise RuntimeError(
+                        f"Real-ESRGAN GPU 推理失败 (条带 {i + 1}/{n}), 已尝试分块 "
+                        f"{'/'.join(str(t) for t in REALESRGAN_TILE_LADDER)}: "
+                        f"{err}\n{fail_hint}")
+                with Image.open(tdp / f"out_{i}.png") as piece:
+                    # 只取条带内部区域 (裁掉为相邻条带保留的重叠边), 对齐到输出画布
+                    interior = piece.crop(
+                        (0, (y0 - sy0) * 4, w * 4, (y1 - sy0) * 4)).convert(mode)
+                    result.paste(interior, (0, y0 * 4))
+                print(f"  [i] 条带 {i + 1}/{n} 完成")
 
     # GPU 输出已含细节, 直接对齐目标尺寸, 不做锐化
     if result.size == (tw, th):
